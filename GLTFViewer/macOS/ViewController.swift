@@ -72,6 +72,7 @@ private struct GLTFRealityViewer: View {
     @State private var progress: Double = 0
     @State private var duration: Double = 1.0
     @State private var playbackTimer: Timer?
+    @State private var blendShapePanels: [BlendShapePanelInfo] = []
 
     private enum LoopMode: Int, CaseIterable {
         case loopAll
@@ -88,7 +89,7 @@ private struct GLTFRealityViewer: View {
     }
 
     var body: some View {
-        ZStack(alignment: .bottom) {
+        ZStack {
             RealityView(make: { content in
                 content.camera = .virtual
             }, update: { content in
@@ -105,11 +106,18 @@ private struct GLTFRealityViewer: View {
             .realityViewCameraControls(.orbit)
             .background(Color(nsColor: NSColor(named: "BackgroundColor") ?? .white))
 
+            if !blendShapePanels.isEmpty {
+                blendShapeOverlay
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                    .padding(12)
+            }
+
             if !animations.isEmpty {
                 playbackOverlay
                     .padding(12)
                     .background(.ultraThinMaterial)
                     .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                     .padding(.bottom, 8)
             }
         }
@@ -177,11 +185,31 @@ private struct GLTFRealityViewer: View {
         .frame(width: 520)
     }
 
+    private var blendShapeOverlay: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Blend Shapes")
+                .font(.headline)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    ForEach(blendShapePanels) { panel in
+                        BlendShapePanelView(panel: panel)
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+        }
+        .padding(12)
+        .background(.ultraThinMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .frame(width: 300, height: 360)
+    }
+
     private func loadAsset() {
         stopPlayback()
         guard let asset = state.asset, let scene = asset.defaultScene else {
             currentEntity = nil
             animations = []
+            blendShapePanels = []
             return
         }
 
@@ -190,11 +218,42 @@ private struct GLTFRealityViewer: View {
             normalize(entity: entity)
             currentEntity = entity
             animations = entity.availableAnimations
+            blendShapePanels = collectBlendShapePanels(from: entity)
             selectedAnimationIndex = 0
             if !animations.isEmpty {
                 startSelectedAnimation(startsPaused: true)
             }
         }
+    }
+
+    private func collectBlendShapePanels(from root: Entity) -> [BlendShapePanelInfo] {
+        var results: [BlendShapePanelInfo] = []
+
+        func walk(_ entity: Entity) {
+            if let component = entity.components[BlendShapeWeightsComponent.self] {
+                let entityName = entity.name.isEmpty ? "Entity" : entity.name
+                for setIndex in 0..<component.weightSet.count {
+                    let data = component.weightSet[setIndex]
+                    let names = data.weightNames
+                    let weights = Array(data.weights)
+                    if !names.isEmpty || !weights.isEmpty {
+                        results.append(
+                            BlendShapePanelInfo(entity: entity,
+                                                setIndex: setIndex,
+                                                entityName: entityName,
+                                                weightNames: names.isEmpty ? weights.indices.map { "Weight_\($0)" } : names,
+                                                initialWeights: weights)
+                        )
+                    }
+                }
+            }
+            for child in entity.children {
+                walk(child)
+            }
+        }
+
+        walk(root)
+        return results
     }
 
     private func normalize(entity: Entity) {
@@ -298,5 +357,89 @@ private struct GLTFRealityViewer: View {
 
     private func timeString(_ t: Double) -> String {
         String(format: "%.2f", t)
+    }
+}
+
+@available(macOS 15.0, *)
+fileprivate struct BlendShapePanelInfo: Identifiable {
+    let id = UUID()
+    let entity: Entity
+    let setIndex: Int
+    let entityName: String
+    let weightNames: [String]
+    let initialWeights: [Float]
+}
+
+@available(macOS 15.0, *)
+private struct BlendShapePanelView: View {
+    let panel: BlendShapePanelInfo
+    @State private var weights: [Float]
+
+    init(panel: BlendShapePanelInfo) {
+        self.panel = panel
+        _weights = State(initialValue: panel.initialWeights)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(panel.entityName)
+                    .font(.subheadline)
+                    .bold()
+                Spacer()
+                Button("Reset") {
+                    reset()
+                }
+                .buttonStyle(.link)
+            }
+
+            ForEach(panel.weightNames.indices, id: \.self) { idx in
+                HStack(spacing: 8) {
+                    Text(panel.weightNames[idx])
+                        .lineLimit(1)
+                        .frame(width: 140, alignment: .leading)
+                    Slider(value: binding(for: idx), in: 0...1)
+                    Text(String(format: "%.2f", weights[safe: idx] ?? 0))
+                        .font(.system(.caption, design: .monospaced))
+                        .frame(width: 40, alignment: .trailing)
+                }
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func binding(for idx: Int) -> Binding<Float> {
+        Binding<Float>(
+            get: { weights[safe: idx] ?? 0 },
+            set: { newValue in
+                if idx < weights.count {
+                    weights[idx] = newValue
+                    apply()
+                }
+            }
+        )
+    }
+
+    private func apply() {
+        guard var component = panel.entity.components[BlendShapeWeightsComponent.self],
+              panel.setIndex < component.weightSet.count
+        else { return }
+
+        var data = component.weightSet[panel.setIndex]
+        data.weights = BlendShapeWeights(weights)
+        component.weightSet[panel.setIndex] = data
+        panel.entity.components.set(component)
+    }
+
+    private func reset() {
+        weights = panel.initialWeights
+        apply()
+    }
+}
+
+fileprivate extension Array {
+    subscript(safe index: Int) -> Element? {
+        guard index >= 0 && index < count else { return nil }
+        return self[index]
     }
 }
